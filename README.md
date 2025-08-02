@@ -168,8 +168,5 @@ your-project/
 
 ## Notes
 
-- The cache directory and database file will be created automatically
-- Make sure your `.env` file is not committed to version control
-- Add `.env` to your `.gitignore` file
 - The proxy runs on `http://localhost:8000` by default
 - All cache entries include a session ID for tracking across restarts
