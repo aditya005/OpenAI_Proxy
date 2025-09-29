@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OpenAI-compatible proxy with file-based caching - Improved Version
+OpenAI-compatible proxy with file-based caching and mock response feature
 """
 
 import json
@@ -10,6 +10,7 @@ import asyncio
 import aiosqlite
 import logging
 import httpx
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
@@ -38,6 +39,15 @@ class Settings(BaseSettings):
     store_cache: bool = False
     cache_dir: str = "./cache"
     timeout: float = 30.0
+    port: int = 8000
+    # Mock response settings
+    mock_response: bool = False
+    mock_delay: float = 0.5  # Simulated response delay in seconds
+    # Customizable mock content
+    mock_chat_content: str = "[MOCK RESPONSE] This is a simulated chat response."
+    mock_completion_content: str = "[MOCK RESPONSE] This is a simulated completion."
+    mock_models: str = "gpt-4,gpt-3.5-turbo,text-davinci-003"  # Comma-separated model names
+    mock_token_usage: str = "50,25,75"  # prompt_tokens,completion_tokens,total_tokens
 
     class Config:
         env_file = ".env"
@@ -88,6 +98,144 @@ cache_lock = asyncio.Lock()
 active_requests = {}
 
 
+def parse_token_usage() -> tuple[int, int, int]:
+    """Parse token usage from settings with fallback defaults"""
+    try:
+        tokens = settings.mock_token_usage.split(",")
+        if len(tokens) == 3:
+            prompt_tokens = int(tokens[0].strip())
+            completion_tokens = int(tokens[1].strip()) 
+            total_tokens = int(tokens[2].strip())
+            return prompt_tokens, completion_tokens, total_tokens
+    except (ValueError, AttributeError):
+        pass
+    
+    # Default fallback
+    return 50, 25, 75
+
+
+def generate_mock_chat_response(request_data: dict, request_id: str) -> dict:
+    """Generate a customizable mock chat completion response"""
+    messages = request_data.get("messages", [])
+    model = settings.override_model or request_data.get("model", "gpt-3.5-turbo")
+    
+    # Get customizable content or use default
+    mock_content = settings.mock_chat_content
+    
+    # If content contains placeholders, try to fill them
+    if "{user_message}" in mock_content or "{model}" in mock_content or "{request_id}" in mock_content:
+        # Extract the last user message for context
+        user_message = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                user_message = msg.get("content", "")[:200]  # First 200 chars
+                break
+        
+        mock_content = mock_content.replace("{user_message}", user_message)
+        mock_content = mock_content.replace("{model}", model)
+        mock_content = mock_content.replace("{request_id}", request_id)
+    
+    # Parse token usage
+    prompt_tokens, completion_tokens, total_tokens = parse_token_usage()
+    
+    return {
+        "id": f"chatcmpl-mock-{request_id}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": mock_content
+                },
+                "finish_reason": "stop"
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens
+        }
+    }
+
+
+def generate_mock_completion_response(request_data: dict, request_id: str) -> dict:
+    """Generate a customizable mock text completion response"""
+    prompt = request_data.get("prompt", "")
+    model = settings.override_model or request_data.get("model", "text-davinci-003")
+    
+    # Get customizable content or use default
+    mock_content = settings.mock_completion_content
+    
+    # If content contains placeholders, try to fill them
+    if "{prompt}" in mock_content or "{model}" in mock_content or "{request_id}" in mock_content:
+        # Handle both string and list prompts
+        if isinstance(prompt, list):
+            prompt_text = str(prompt[0])[:200] if prompt else ""
+        else:
+            prompt_text = str(prompt)[:200]
+        
+        mock_content = mock_content.replace("{prompt}", prompt_text)
+        mock_content = mock_content.replace("{model}", model)
+        mock_content = mock_content.replace("{request_id}", request_id)
+    
+    # Parse token usage
+    prompt_tokens, completion_tokens, total_tokens = parse_token_usage()
+    
+    return {
+        "id": f"cmpl-mock-{request_id}",
+        "object": "text_completion", 
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "text": mock_content,
+                "index": 0,
+                "finish_reason": "stop"
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens
+        }
+    }
+
+
+def generate_mock_models_list() -> dict:
+    """Generate a customizable mock models list response"""
+    # Parse models from settings
+    model_names = []
+    try:
+        if settings.mock_models:
+            model_names = [name.strip() for name in settings.mock_models.split(",") if name.strip()]
+    except AttributeError:
+        pass
+    
+    # Use default models if none specified or parsing failed
+    if not model_names:
+        model_names = ["gpt-4", "gpt-3.5-turbo", "text-davinci-003"]
+    
+    # Generate mock model objects
+    mock_models = []
+    base_time = int(time.time()) - 86400  # 1 day ago
+    
+    for i, model_name in enumerate(model_names):
+        mock_models.append({
+            "id": model_name,
+            "object": "model",
+            "created": base_time + i,  # Slightly different timestamps
+            "owned_by": "openai"
+        })
+    
+    return {
+        "object": "list",
+        "data": mock_models
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global async_http_client
@@ -96,14 +244,15 @@ async def lifespan(app: FastAPI):
     Path(settings.cache_dir).mkdir(parents=True, exist_ok=True)
     await init_cache_db()
 
-    # Initialize async HTTP client for cancellable requests
-    async_http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(settings.timeout),
-        headers={
-            "Authorization": f"Bearer {settings.openai_api_key}",
-            "Content-Type": "application/json",
-        },
-    )
+    # Initialize async HTTP client for cancellable requests (only if not using mock)
+    if not settings.mock_response:
+        async_http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.timeout),
+            headers={
+                "Authorization": f"Bearer {settings.openai_api_key}",
+                "Content-Type": "application/json",
+            },
+        )
 
     logger.info("OpenAI Proxy started with:")
     logger.info(f"  Session ID: {SESSION_ID}")
@@ -112,6 +261,13 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Cache DB: {get_cache_db_path()}")
     logger.info(f"  Respond with Cache: {settings.respond_with_cache}")
     logger.info(f"  Store Cache: {settings.store_cache}")
+    logger.info(f"  Mock Response: {settings.mock_response}")
+    if settings.mock_response:
+        logger.info(f"  Mock Delay: {settings.mock_delay}s")
+        logger.info(f"  Mock Chat Content: {settings.mock_chat_content[:50]}...")
+        logger.info(f"  Mock Completion Content: {settings.mock_completion_content[:50]}...")
+        logger.info(f"  Mock Models: {settings.mock_models}")
+        logger.info(f"  Mock Token Usage: {settings.mock_token_usage}")
 
     yield
 
@@ -337,6 +493,25 @@ async def monitor_client_disconnect(request: Request, request_id: str) -> bool:
         return False
 
 
+async def generate_mock_response(request_data: dict, endpoint_type: str, request_id: str) -> tuple[dict, int]:
+    """Generate mock response with simulated delay"""
+    logger.info(f"[{request_id}] Generating mock {endpoint_type} response")
+    
+    # Simulate processing delay
+    if settings.mock_delay > 0:
+        await asyncio.sleep(settings.mock_delay)
+    
+    if endpoint_type == "chat":
+        response_data = generate_mock_chat_response(request_data, request_id)
+    elif endpoint_type == "completions":
+        response_data = generate_mock_completion_response(request_data, request_id)
+    else:
+        raise ValueError(f"Unknown endpoint type: {endpoint_type}")
+    
+    logger.info(f"[{request_id}] Mock response generated successfully")
+    return response_data, 200
+
+
 async def forward_request(
     request_data: dict,
     endpoint_type: str,
@@ -479,36 +654,46 @@ async def handle_request(request: Request, endpoint_type: str):
 
         logger.info(f"[{request_id}] Cache key: {cache_key[:12]}...")
 
-        # Try cache first
-        cached_entry = await load_cached_response(cache_key)
-        if cached_entry:
-            logger.info(
-                f"[{request_id}] Serving from cache (created: {cached_entry['metadata']['created_at']})"
+        # Try cache first (unless using mock responses)
+        if not settings.mock_response:
+            cached_entry = await load_cached_response(cache_key)
+            if cached_entry:
+                logger.info(
+                    f"[{request_id}] Serving from cache (created: {cached_entry['metadata']['created_at']})"
+                )
+                response = JSONResponse(cached_entry["response"])
+                response.headers["X-Cache"] = "HIT"
+                response.headers["X-Model-Used"] = effective_model
+                response.headers["X-Request-ID"] = request_id
+                return response
+
+        # Generate response (either mock or real)
+        if settings.mock_response:
+            logger.info(f"[{request_id}] Using mock response mode")
+            response_data, status_code = await generate_mock_response(
+                request_data, endpoint_type, request_id
             )
-            response = JSONResponse(cached_entry["response"])
-            response.headers["X-Cache"] = "HIT"
-            response.headers["X-Model-Used"] = effective_model
-            response.headers["X-Request-ID"] = request_id
-            return response
+            cache_status = "MOCK"
+        else:
+            logger.info(f"[{request_id}] Cache MISS - forwarding to upstream API")
+            response_data, status_code = await forward_request(
+                request_data, endpoint_type, request_id, disconnect_event
+            )
+            cache_status = "MISS"
 
-        logger.info(f"[{request_id}] Cache MISS - forwarding to upstream API")
-
-        # Forward to upstream
-        response_data, status_code = await forward_request(
-            request_data, endpoint_type, request_id, disconnect_event
-        )
-
-        # Store in cache if successful
-        if status_code == 200:
+        # Store in cache if successful and not using mock responses
+        if status_code == 200 and not settings.mock_response:
             logger.info(f"[{request_id}] Storing response in cache")
             await store_cached_response(
                 cache_key, canonical_request, request_data, response_data, status_code
             )
 
         response = JSONResponse(response_data, status_code=status_code)
-        response.headers["X-Cache"] = "MISS"
+        response.headers["X-Cache"] = cache_status
         response.headers["X-Model-Used"] = effective_model
         response.headers["X-Request-ID"] = request_id
+        if settings.mock_response:
+            response.headers["X-Mock-Response"] = "true"
         return response
 
     except HTTPException:
@@ -548,6 +733,11 @@ async def completions(request: Request):
 
 @app.get("/v1/models")
 async def list_models():
+    # Return mock models list if in mock mode
+    if settings.mock_response:
+        logger.info("Returning mock models list")
+        return generate_mock_models_list()
+    
     try:
         response = openai_client.models.list()
         return response.model_dump()
@@ -567,6 +757,7 @@ async def health_check():
         "session_id": SESSION_ID,
         "active_requests": active_count,
         "cache_enabled": settings.respond_with_cache,
+        "mock_mode": settings.mock_response,
     }
 
 
@@ -601,6 +792,14 @@ async def get_stats():
                 "respond_with_cache": settings.respond_with_cache,
                 "store_cache": settings.store_cache,
             },
+            "mock_mode": {
+                "enabled": settings.mock_response,
+                "delay": settings.mock_delay,
+                "chat_content": settings.mock_chat_content[:100] + "..." if len(settings.mock_chat_content) > 100 else settings.mock_chat_content,
+                "completion_content": settings.mock_completion_content[:100] + "..." if len(settings.mock_completion_content) > 100 else settings.mock_completion_content,
+                "models": settings.mock_models,
+                "token_usage": settings.mock_token_usage,
+            },
         }
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
@@ -608,4 +807,4 @@ async def get_stats():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=settings.port, reload=True)
